@@ -1,11 +1,10 @@
 import ctypes
-import json
 import os
-import tempfile
+import queue
+import sys
 import threading
 import time
 import traceback
-import urllib.request
 from ctypes import wintypes
 from dataclasses import dataclass
 from typing import List, Optional
@@ -14,10 +13,15 @@ import keyboard
 import pyperclip
 import pyttsx3
 
-try:
-    import winsound
-except ImportError:
-    winsound = None
+from app_config import AppConfig, load_app_config
+from audio_player import AudioPlayer
+from tts_client import (
+    OpenAITTSClient,
+    TTSClientError,
+    cleanup_temp_file,
+    split_text_into_sentence_chunks,
+    write_temp_audio_file,
+)
 
 
 user32 = ctypes.windll.user32
@@ -54,23 +58,32 @@ CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 
 
-def _read_float_env(name, default_value):
-    raw_value = os.getenv(name)
-    if raw_value is None or raw_value.strip() == "":
-        return default_value
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_CONFIG: AppConfig = load_app_config(BASE_DIR)
 
-    try:
-        return float(raw_value)
-    except ValueError:
-        return default_value
+HOTKEY = APP_CONFIG.read_hotkey
+STOP_HOTKEY = APP_CONFIG.stop_hotkey
+QUIT_HOTKEY = APP_CONFIG.quit_hotkey
+COPY_TIMEOUT_SECONDS = APP_CONFIG.copy_timeout_seconds
+COPY_POLL_INTERVAL_SECONDS = APP_CONFIG.copy_poll_interval_seconds
+REQUEST_QUEUE_MAXSIZE = APP_CONFIG.request_queue_maxsize
+TTS_BACKEND = APP_CONFIG.tts_backend
+HTTP_TTS_CONFIG = APP_CONFIG.http_tts
+HTTP_TTS_FALLBACK_TO_PYTTSX3 = APP_CONFIG.fallback_to_pyttsx3
+WORKSPACE_VENV_PYTHON = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
 
 
-HOTKEY = os.getenv("READ_HOTKEY", "alt+z").strip() or "alt+z"
-COPY_TIMEOUT_SECONDS = _read_float_env("COPY_TIMEOUT_SECONDS", 1.5)
-COPY_POLL_INTERVAL_SECONDS = _read_float_env("COPY_POLL_INTERVAL_SECONDS", 0.02)
-TTS_BACKEND = os.getenv("TTS_BACKEND", "pyttsx3").strip().lower() or "pyttsx3"
-TTS_API_URL = os.getenv("TTS_API_URL", "http://127.0.0.1:8000/tts").strip()
-TTS_HTTP_TIMEOUT_SECONDS = _read_float_env("TTS_HTTP_TIMEOUT_SECONDS", 30.0)
+def format_hotkey_for_display(hotkey):
+    return hotkey.upper().replace("+", " + ")
+
+
+def is_running_workspace_venv():
+    if not os.path.exists(WORKSPACE_VENV_PYTHON):
+        return False
+
+    current_python = os.path.normcase(os.path.abspath(sys.executable))
+    expected_python = os.path.normcase(os.path.abspath(WORKSPACE_VENV_PYTHON))
+    return current_python == expected_python
 
 
 def _open_clipboard_with_retry(timeout_seconds=0.25, poll_interval_seconds=0.01):
@@ -241,97 +254,243 @@ class SpeechBackend(object):
     def speak(self, text):
         raise NotImplementedError
 
+    def interrupt(self):
+        return None
+
+    def shutdown(self):
+        return None
+
 
 class Pyttsx3Backend(SpeechBackend):
     def __init__(self):
-        self._engine = pyttsx3.init()
         self._speak_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._generation = 0
+        self._current_engine = None
+
+    def _current_generation(self):
+        with self._state_lock:
+            return self._generation
+
+    def interrupt(self):
+        with self._state_lock:
+            self._generation += 1
+            engine = self._current_engine
+
+        if engine is not None:
+            try:
+                engine.stop()
+            except Exception:
+                pass
 
     def speak(self, text):
+        request_generation = self._current_generation()
+
         with self._speak_lock:
-            self._engine.say(text)
-            self._engine.runAndWait()
+            if request_generation != self._current_generation():
+                return
+
+            engine = pyttsx3.init()
+            with self._state_lock:
+                self._current_engine = engine
+
+            try:
+                engine.say(text)
+                engine.runAndWait()
+            finally:
+                with self._state_lock:
+                    if self._current_engine is engine:
+                        self._current_engine = None
+
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
 
 
-class HttpWavBackend(SpeechBackend):
-    def __init__(self, endpoint_url, timeout_seconds=TTS_HTTP_TIMEOUT_SECONDS):
-        self.endpoint_url = endpoint_url
-        self.timeout_seconds = timeout_seconds
+class HttpTTSBackend(SpeechBackend):
+    def __init__(self, http_config, fallback_backend=None):
+        self.http_config = http_config
+        self.fallback_backend = fallback_backend
+        self.client = OpenAITTSClient(http_config)
+        self.audio_player = AudioPlayer()
+        self._state_lock = threading.Lock()
+        self._generation = 0
+
+    def _current_generation(self):
+        with self._state_lock:
+            return self._generation
+
+    def _is_stale(self, request_generation):
+        return request_generation != self._current_generation()
+
+    def interrupt(self):
+        with self._state_lock:
+            self._generation += 1
+
+        self.audio_player.interrupt(clear_queue=True)
+
+    def shutdown(self):
+        self.audio_player.shutdown()
+        if self.fallback_backend is not None:
+            self.fallback_backend.shutdown()
 
     def speak(self, text):
-        payload = json.dumps({"text": text}).encode("utf-8")
-        request = urllib.request.Request(
-            self.endpoint_url,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "audio/wav",
-            },
-        )
-
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-            audio_bytes = response.read()
-            content_type = response.headers.get("Content-Type", "")
-
-        if not audio_bytes:
-            raise RuntimeError("TTS endpoint returned an empty response.")
-
-        if "wav" not in content_type.lower() and "wave" not in content_type.lower():
-            print("Warning: HTTP TTS backend expected WAV audio, but the endpoint returned:", content_type)
-
-        if winsound is None:
-            raise RuntimeError("winsound is required to play WAV audio on Windows.")
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio_file:
-            temp_audio_file.write(audio_bytes)
-            temp_audio_path = temp_audio_file.name
+        request_generation = self._current_generation()
 
         try:
-            winsound.PlaySound(temp_audio_path, winsound.SND_FILENAME)
-        finally:
-            try:
-                os.remove(temp_audio_path)
-            except OSError:
-                pass
+            self._speak_http(text, request_generation)
+        except Exception as exc:
+            if self._is_stale(request_generation):
+                return
+
+            if self.fallback_backend is None:
+                raise
+
+            print("HTTP TTS failed ({0}); using pyttsx3 fallback.".format(exc))
+            self.fallback_backend.speak(text)
+
+    def _speak_http(self, text, request_generation):
+        chunks = [text]
+        if self.http_config.chunking_enabled:
+            chunked_text = split_text_into_sentence_chunks(text, self.http_config.max_chunk_chars)
+            if chunked_text:
+                chunks = chunked_text
+
+        start_time = time.monotonic()
+        first_audio_logged = False
+
+        for chunk in chunks:
+            if self._is_stale(request_generation):
+                return
+
+            result = self.client.synthesize(chunk)
+            if self._is_stale(request_generation):
+                return
+
+            if not first_audio_logged:
+                latency_ms = int((time.monotonic() - start_time) * 1000)
+                mode_label = "streaming" if result.used_streaming else "buffered"
+                if len(chunks) > 1:
+                    mode_label = mode_label + " + sentence-chunking"
+                print("HTTP TTS first-audio latency: {0} ms ({1}).".format(latency_ms, mode_label))
+                first_audio_logged = True
+
+            default_extension = "." + str(self.http_config.response_format).lstrip(".")
+            temp_audio_path = write_temp_audio_file(
+                audio_bytes=result.audio_bytes,
+                content_type=result.content_type,
+                default_extension=default_extension,
+            )
+
+            if self._is_stale(request_generation):
+                cleanup_temp_file(temp_audio_path)
+                return
+
+            self.audio_player.enqueue_file(
+                file_path=temp_audio_path,
+                generation=request_generation,
+                cleanup_callback=cleanup_temp_file,
+            )
+
+        if len(chunks) > 1:
+            total_ms = int((time.monotonic() - start_time) * 1000)
+            print("HTTP TTS queued {0} chunks in {1} ms.".format(len(chunks), total_ms))
 
 
 def build_tts_backend():
-    if TTS_BACKEND in ("http", "kokoro", "api"):
-        return HttpWavBackend(TTS_API_URL)
+    pyttsx3_backend = Pyttsx3Backend()
+
+    if TTS_BACKEND in ("http", "kokoro", "api", "openai"):
+        fallback_backend = pyttsx3_backend if HTTP_TTS_FALLBACK_TO_PYTTSX3 else None
+        try:
+            return HttpTTSBackend(HTTP_TTS_CONFIG, fallback_backend=fallback_backend)
+        except Exception as exc:
+            if fallback_backend is None:
+                raise
+
+            print("HTTP backend init failed ({0}); falling back to pyttsx3.".format(exc))
+            return pyttsx3_backend
 
     if TTS_BACKEND != "pyttsx3":
         print("Unknown TTS_BACKEND value; falling back to pyttsx3.")
 
-    return Pyttsx3Backend()
+    return pyttsx3_backend
 
 
 @dataclass
 class ReaderConfig(object):
     hotkey: str = HOTKEY
+    stop_hotkey: str = STOP_HOTKEY
+    quit_hotkey: str = QUIT_HOTKEY
     copy_timeout_seconds: float = COPY_TIMEOUT_SECONDS
     poll_interval_seconds: float = COPY_POLL_INTERVAL_SECONDS
+    request_queue_maxsize: int = REQUEST_QUEUE_MAXSIZE
 
 
 class TextReaderApp(object):
     def __init__(self, backend, config=None):
         self.backend = backend
         self.config = config or ReaderConfig()
-        self._processing_lock = threading.Lock()
+        self._request_queue = queue.Queue(maxsize=self.config.request_queue_maxsize)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="text-reader-worker")
+        self._worker.start()
 
     def handle_hotkey(self):
-        if not self._processing_lock.acquire(False):
+        if self._stop_event.is_set():
             return
 
-        worker = threading.Thread(target=self._process_selection, daemon=True)
-        try:
-            worker.start()
-        except Exception:
-            self._processing_lock.release()
-            raise
+        # Read hotkey preempts old playback and pending chunks before processing new selection.
+        self.backend.interrupt()
+        self._clear_pending_requests()
 
-    def _process_selection(self):
+        self._enqueue_read_request()
+
+    def handle_stop_hotkey(self):
+        if self._stop_event.is_set():
+            return
+
+        self.backend.interrupt()
+        self._clear_pending_requests()
+        print("Playback stopped and queue cleared.")
+
+    def _enqueue_read_request(self):
+        try:
+            self._request_queue.put_nowait(time.monotonic())
+            if self._request_queue.qsize() > 1:
+                print("Reader is busy; request queued.")
+        except queue.Full:
+            print("Reader queue is full; wait for current speech to finish.")
+
+    def _clear_pending_requests(self):
+        while True:
+            try:
+                self._request_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def stop(self):
+        self._stop_event.set()
+        self.backend.interrupt()
+        if self._worker.is_alive():
+            self._worker.join(timeout=1.5)
+        self.backend.shutdown()
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                self._request_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            try:
+                self._process_selection_once()
+            except Exception:
+                traceback.print_exc()
+
+    def _process_selection_once(self):
         snapshot = None
-        text = None
 
         try:
             snapshot = ClipboardSnapshot.capture()
@@ -353,30 +512,55 @@ class TextReaderApp(object):
             self.backend.speak(text)
         except Exception:
             traceback.print_exc()
-            return
         finally:
             if snapshot is not None:
                 try:
                     snapshot.restore()
                 except Exception:
                     traceback.print_exc()
-            self._processing_lock.release()
 
 
 def main():
     backend = build_tts_backend()
     app = TextReaderApp(backend)
+    shutdown_event = threading.Event()
+
+    def request_shutdown():
+        print("Shutdown requested. Exiting...")
+        shutdown_event.set()
 
     print("Prototype running...")
     print("1. Highlight any text in any app.")
-    print("2. Press '{0}' to read it.".format(app.config.hotkey.upper().replace("+", " + ")))
-    print("Press 'Esc' to quit the script.")
+    print("2. Press '{0}' to read it.".format(format_hotkey_for_display(app.config.hotkey)))
+    print("3. Press '{0}' to stop current playback.".format(format_hotkey_for_display(app.config.stop_hotkey)))
+    print("Press '{0}' to quit the script.".format(format_hotkey_for_display(app.config.quit_hotkey)))
     print("Using TTS backend: {0}".format(TTS_BACKEND))
-    if isinstance(backend, HttpWavBackend):
-        print("HTTP TTS endpoint: {0}".format(backend.endpoint_url))
+    print("Active profile: {0}".format(APP_CONFIG.active_profile))
+    if APP_CONFIG.available_profiles:
+        print("Available profiles: {0}".format(", ".join(APP_CONFIG.available_profiles)))
+    print("Config sources: {0}".format(APP_CONFIG.source_summary))
+    print("Python interpreter: {0}".format(sys.executable))
+    if not is_running_workspace_venv():
+        print("Warning: not running workspace .venv interpreter.")
+        print("Expected: {0}".format(WORKSPACE_VENV_PYTHON))
+    if isinstance(backend, HttpTTSBackend):
+        print("HTTP TTS endpoint: {0}".format(backend.http_config.url))
+        print("HTTP voice/model: {0}/{1}".format(backend.http_config.voice, backend.http_config.model))
+        print("HTTP streaming mode: {0}".format(backend.http_config.streaming_mode))
+        print("HTTP chunk fallback enabled: {0}".format(backend.http_config.chunking_enabled))
+        print("HTTP pyttsx3 fallback enabled: {0}".format(bool(backend.fallback_backend)))
 
-    keyboard.add_hotkey(app.config.hotkey, app.handle_hotkey, suppress=True, trigger_on_release=True)
-    keyboard.wait("esc")
+    read_hotkey_id = keyboard.add_hotkey(app.config.hotkey, app.handle_hotkey, suppress=True, trigger_on_release=True)
+    stop_hotkey_id = keyboard.add_hotkey(app.config.stop_hotkey, app.handle_stop_hotkey, suppress=True, trigger_on_release=True)
+    quit_hotkey_id = keyboard.add_hotkey(app.config.quit_hotkey, request_shutdown, suppress=True, trigger_on_release=True)
+
+    try:
+        shutdown_event.wait()
+    finally:
+        keyboard.remove_hotkey(read_hotkey_id)
+        keyboard.remove_hotkey(stop_hotkey_id)
+        keyboard.remove_hotkey(quit_hotkey_id)
+        app.stop()
 
 
 if __name__ == "__main__":

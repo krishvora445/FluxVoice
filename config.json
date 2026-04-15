@@ -1,0 +1,64 @@
+{
+  "active_profile": "pyttsx3-local",
+  "profiles": {
+    "pyttsx3-local": {
+      "tts": {
+        "backend": "pyttsx3",
+        "fallback_to_pyttsx3": true
+      }
+    },
+    "kokoro-fastapi-local": {
+      "tts": {
+        "backend": "http",
+        "fallback_to_pyttsx3": true,
+        "http": {
+          "url": "http://127.0.0.1:8880/v1/audio/speech",
+          "model": "kokoro",
+          "voice": "af_heart",
+          "response_format": "wav",
+          "streaming_mode": "auto"
+        }
+      }
+    },
+    "openai-compatible-local": {
+      "tts": {
+        "backend": "http",
+        "fallback_to_pyttsx3": true,
+        "http": {
+          "url": "http://127.0.0.1:8091/v1/audio/speech",
+          "model": "tts-1",
+          "voice": "alloy",
+          "response_format": "wav",
+          "streaming_mode": "auto"
+        }
+      }
+    }
+  },
+  "hotkeys": {
+    "read": "alt+z",
+    "stop": "alt+x",
+    "quit": "ctrl+alt+q"
+  },
+  "clipboard": {
+    "copy_timeout_seconds": 1.5,
+    "poll_interval_seconds": 0.02
+  },
+  "queue": {
+    "maxsize": 4
+  },
+  "tts": {
+    "backend": "pyttsx3",
+    "fallback_to_pyttsx3": true,
+    "http": {
+      "url": "http://127.0.0.1:8000/v1/audio/speech",
+      "timeout_seconds": 30.0,
+      "streaming_mode": "auto",
+      "chunking_enabled": true,
+      "max_chunk_chars": 350,
+      "model": "kokoro",
+      "voice": "af_heart",
+      "response_format": "wav",
+      "api_key": ""
+    }
+  }
+}

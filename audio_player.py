@@ -23,7 +23,7 @@ class PlaybackItem(object):
 
 
 class AudioPlayer(object):
-    def __init__(self, poll_interval_seconds=0.01):
+    def __init__(self, poll_interval_seconds=0.01, on_playback_start=None, on_playback_stop=None):
         if pygame is None:
             raise RuntimeError(
                 "pygame is required for AudioPlayer. Install it with `pip install pygame`."
@@ -36,6 +36,8 @@ class AudioPlayer(object):
         self._state_lock = threading.Lock()
         self._generation = 0
         self._current_item = None
+        self._on_playback_start = on_playback_start
+        self._on_playback_stop = on_playback_stop
 
         self._init_mixer()
 
@@ -141,6 +143,11 @@ class AudioPlayer(object):
         try:
             pygame.mixer.music.load(item.file_path)
             pygame.mixer.music.play()
+            if self._on_playback_start is not None:
+                try:
+                    self._on_playback_start(item)
+                except Exception:
+                    traceback.print_exc()
 
             while pygame.mixer.music.get_busy():
                 if self._stop_event.is_set() or self._interrupt_event.is_set():
@@ -161,6 +168,11 @@ class AudioPlayer(object):
             with self._state_lock:
                 self._current_item = None
             self._interrupt_event.clear()
+            if self._on_playback_stop is not None:
+                try:
+                    self._on_playback_stop(item)
+                except Exception:
+                    traceback.print_exc()
 
     def _cleanup_item(self, item):
         if item.cleanup_callback is None:

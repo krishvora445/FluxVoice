@@ -2,4 +2,6 @@ keyboard
 pyperclip
 pyttsx3
 pygame
+pystray
+Pillow
 

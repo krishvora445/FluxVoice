@@ -15,6 +15,8 @@ import pyttsx3
 
 from app_config import AppConfig, load_app_config
 from audio_player import AudioPlayer
+from floating_dot import FloatingDotWindow
+from tray_icon import SystemTrayIcon
 from tts_client import (
     OpenAITTSClient,
     TTSClientError,
@@ -22,6 +24,7 @@ from tts_client import (
     split_text_into_sentence_chunks,
     write_temp_audio_file,
 )
+from ui_state import UIState, UIStateBus
 
 
 user32 = ctypes.windll.user32
@@ -309,11 +312,14 @@ class Pyttsx3Backend(SpeechBackend):
 
 
 class HttpTTSBackend(SpeechBackend):
-    def __init__(self, http_config, fallback_backend=None):
+    def __init__(self, http_config, fallback_backend=None, on_playback_start=None, on_playback_stop=None):
         self.http_config = http_config
         self.fallback_backend = fallback_backend
         self.client = OpenAITTSClient(http_config)
-        self.audio_player = AudioPlayer()
+        self.audio_player = AudioPlayer(
+            on_playback_start=on_playback_start,
+            on_playback_stop=on_playback_stop,
+        )
         self._state_lock = threading.Lock()
         self._generation = 0
 
@@ -411,13 +417,18 @@ def preflight_http_tts_endpoint(http_config):
     return True, "ok"
 
 
-def build_tts_backend():
+def build_tts_backend(on_playback_start=None, on_playback_stop=None):
     pyttsx3_backend = Pyttsx3Backend()
 
     if TTS_BACKEND in ("http", "kokoro", "api", "openai"):
         fallback_backend = pyttsx3_backend if HTTP_TTS_FALLBACK_TO_PYTTSX3 else None
         try:
-            http_backend = HttpTTSBackend(HTTP_TTS_CONFIG, fallback_backend=fallback_backend)
+            http_backend = HttpTTSBackend(
+                HTTP_TTS_CONFIG,
+                fallback_backend=fallback_backend,
+                on_playback_start=on_playback_start,
+                on_playback_stop=on_playback_stop,
+            )
             preflight_ok, preflight_message = preflight_http_tts_endpoint(HTTP_TTS_CONFIG)
             if preflight_ok:
                 return http_backend
@@ -448,35 +459,58 @@ class ReaderConfig(object):
 
 
 class TextReaderApp(object):
-    def __init__(self, backend, config=None):
+    def __init__(self, backend, state_bus, config=None):
         self.backend = backend
+        self.state_bus = state_bus
         self.config = config or ReaderConfig()
         self._request_queue = queue.Queue(maxsize=self.config.request_queue_maxsize)
         self._stop_event = threading.Event()
+        self._request_state_lock = threading.Lock()
+        self._request_epoch = 0
+        self._last_hotkey_at = 0.0
+        self._hotkey_debounce_seconds = 0.15
         self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="text-reader-worker")
         self._worker.start()
+
+    def _bump_request_epoch(self):
+        with self._request_state_lock:
+            self._request_epoch += 1
+            return self._request_epoch
+
+    def _current_request_epoch(self):
+        with self._request_state_lock:
+            return self._request_epoch
 
     def handle_hotkey(self):
         if self._stop_event.is_set():
             return
 
+        now = time.monotonic()
+        with self._request_state_lock:
+            if now - self._last_hotkey_at < self._hotkey_debounce_seconds:
+                return
+            self._last_hotkey_at = now
+
         # Read hotkey preempts old playback and pending chunks before processing new selection.
+        epoch = self._bump_request_epoch()
         self.backend.interrupt()
         self._clear_pending_requests()
 
-        self._enqueue_read_request()
+        self._enqueue_read_request(epoch)
 
     def handle_stop_hotkey(self):
         if self._stop_event.is_set():
             return
 
+        self._bump_request_epoch()
         self.backend.interrupt()
         self._clear_pending_requests()
+        self.state_bus.publish(UIState.IDLE)
         print("Playback stopped and queue cleared.")
 
-    def _enqueue_read_request(self):
+    def _enqueue_read_request(self, epoch):
         try:
-            self._request_queue.put_nowait(time.monotonic())
+            self._request_queue.put_nowait(epoch)
             if self._request_queue.qsize() > 1:
                 print("Reader is busy; request queued.")
         except queue.Full:
@@ -499,16 +533,16 @@ class TextReaderApp(object):
     def _worker_loop(self):
         while not self._stop_event.is_set():
             try:
-                self._request_queue.get(timeout=0.2)
+                epoch = self._request_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
             try:
-                self._process_selection_once()
+                self._process_selection_once(epoch)
             except Exception:
                 traceback.print_exc()
 
-    def _process_selection_once(self):
+    def _process_selection_once(self, epoch):
         snapshot = None
 
         try:
@@ -521,15 +555,23 @@ class TextReaderApp(object):
                 poll_interval_seconds=self.config.poll_interval_seconds,
             )
 
+            if epoch != self._current_request_epoch():
+                return
+
             if not text or not text.strip():
+                self.state_bus.publish(UIState.IDLE)
                 print("No text was highlighted. (Make sure the text window is active!)")
                 return
 
             preview = text.replace("\r", " ").replace("\n", " ")
             print("Reading: '{0}...'".format(preview[:50]))
 
+            self.state_bus.publish(UIState.PROCESSING)
             self.backend.speak(text)
+            if not isinstance(self.backend, HttpTTSBackend):
+                self.state_bus.publish(UIState.IDLE)
         except Exception:
+            self.state_bus.publish(UIState.IDLE)
             traceback.print_exc()
         finally:
             if snapshot is not None:
@@ -540,9 +582,27 @@ class TextReaderApp(object):
 
 
 def main():
-    backend = build_tts_backend()
-    app = TextReaderApp(backend)
     shutdown_event = threading.Event()
+    state_bus = UIStateBus()
+
+    def on_playback_start(_item):
+        state_bus.publish(UIState.PLAYING)
+
+    def on_playback_stop(_item):
+        state_bus.publish(UIState.IDLE)
+
+    backend = build_tts_backend(
+        on_playback_start=on_playback_start,
+        on_playback_stop=on_playback_stop,
+    )
+    app = TextReaderApp(backend, state_bus=state_bus)
+    overlay = FloatingDotWindow(state_bus=state_bus, shutdown_event=shutdown_event)
+
+    tray = SystemTrayIcon(
+        on_quit=lambda: shutdown_event.set(),
+        on_settings=lambda: print("Settings clicked (coming soon)."),
+    )
+    tray.start()
 
     def request_shutdown():
         print("Shutdown requested. Exiting...")
@@ -577,11 +637,14 @@ def main():
     quit_hotkey_id = keyboard.add_hotkey(app.config.quit_hotkey, request_shutdown, suppress=True, trigger_on_release=True)
 
     try:
-        shutdown_event.wait()
+        overlay.run()
+    except KeyboardInterrupt:
+        request_shutdown()
     finally:
         keyboard.remove_hotkey(read_hotkey_id)
         keyboard.remove_hotkey(stop_hotkey_id)
         keyboard.remove_hotkey(quit_hotkey_id)
+        tray.stop()
         app.stop()
 
 

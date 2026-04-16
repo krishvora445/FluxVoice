@@ -398,18 +398,37 @@ class HttpTTSBackend(SpeechBackend):
             print("HTTP TTS queued {0} chunks in {1} ms.".format(len(chunks), total_ms))
 
 
+def preflight_http_tts_endpoint(http_config):
+    client = OpenAITTSClient(http_config)
+    try:
+        result = client.synthesize("FluxVoice startup check.")
+    except TTSClientError as exc:
+        return False, str(exc)
+
+    if not result.audio_bytes:
+        return False, "HTTP preflight returned empty audio payload."
+
+    return True, "ok"
+
+
 def build_tts_backend():
     pyttsx3_backend = Pyttsx3Backend()
 
     if TTS_BACKEND in ("http", "kokoro", "api", "openai"):
         fallback_backend = pyttsx3_backend if HTTP_TTS_FALLBACK_TO_PYTTSX3 else None
         try:
-            return HttpTTSBackend(HTTP_TTS_CONFIG, fallback_backend=fallback_backend)
+            http_backend = HttpTTSBackend(HTTP_TTS_CONFIG, fallback_backend=fallback_backend)
+            preflight_ok, preflight_message = preflight_http_tts_endpoint(HTTP_TTS_CONFIG)
+            if preflight_ok:
+                return http_backend
+
+            raise RuntimeError(preflight_message)
         except Exception as exc:
             if fallback_backend is None:
                 raise
 
-            print("HTTP backend init failed ({0}); falling back to pyttsx3.".format(exc))
+            print("HTTP backend init/preflight failed ({0}); falling back to pyttsx3.".format(exc))
+            print("Tip: start your local TTS server and verify endpoint {0}.".format(HTTP_TTS_CONFIG.url))
             return pyttsx3_backend
 
     if TTS_BACKEND != "pyttsx3":
@@ -534,7 +553,10 @@ def main():
     print("2. Press '{0}' to read it.".format(format_hotkey_for_display(app.config.hotkey)))
     print("3. Press '{0}' to stop current playback.".format(format_hotkey_for_display(app.config.stop_hotkey)))
     print("Press '{0}' to quit the script.".format(format_hotkey_for_display(app.config.quit_hotkey)))
-    print("Using TTS backend: {0}".format(TTS_BACKEND))
+    print("Configured TTS backend: {0}".format(TTS_BACKEND))
+    print("Runtime TTS backend: {0}".format(type(backend).__name__))
+    if TTS_BACKEND in ("http", "kokoro", "api", "openai") and not isinstance(backend, HttpTTSBackend):
+        print("Warning: HTTP backend requested, but runtime backend is pyttsx3 fallback.")
     print("Active profile: {0}".format(APP_CONFIG.active_profile))
     if APP_CONFIG.available_profiles:
         print("Available profiles: {0}".format(", ".join(APP_CONFIG.available_profiles)))

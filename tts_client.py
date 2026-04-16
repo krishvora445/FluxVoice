@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import socket
 import tempfile
 import urllib.error
 import urllib.request
@@ -94,6 +95,7 @@ class OpenAITTSClient(object):
             audio_bytes = response.read()
             if not audio_bytes:
                 raise TTSClientError("Streaming request returned an empty body.")
+            _validate_audio_payload(audio_bytes, content_type, "Streaming request")
 
             return SynthesizedAudio(
                 audio_bytes=audio_bytes,
@@ -110,6 +112,7 @@ class OpenAITTSClient(object):
 
         if not audio_bytes:
             raise TTSClientError("Buffered request returned an empty body.")
+        _validate_audio_payload(audio_bytes, content_type, "Buffered request")
 
         return SynthesizedAudio(
             audio_bytes=audio_bytes,
@@ -154,12 +157,18 @@ class OpenAITTSClient(object):
                 error_body = exc.read(500).decode("utf-8", errors="replace")
             except Exception:
                 pass
+            detail = _extract_error_detail(error_body)
+            hint = ""
+            if exc.code == 404:
+                hint = " (check the /v1/audio/speech path and port)"
+            elif exc.code in {401, 403}:
+                hint = " (check TTS_API_KEY / auth settings)"
             raise TTSClientError(
-                "TTS HTTP error {0}: {1}".format(exc.code, error_body or exc.reason)
+                "TTS HTTP error {0}: {1}{2}".format(exc.code, detail or exc.reason, hint)
             ) from exc
         except urllib.error.URLError as exc:
             raise TTSClientError("TTS network error: {0}".format(exc.reason)) from exc
-        except TimeoutError as exc:
+        except (TimeoutError, socket.timeout) as exc:
             raise TTSClientError("TTS request timed out.") from exc
 
     def _iter_sse_audio_chunks(self, response) -> Iterable[bytes]:
@@ -211,6 +220,54 @@ def _extract_base64_audio(message: Dict[str, object]) -> Optional[bytes]:
             continue
 
     return None
+
+
+def _extract_error_detail(error_body: str) -> str:
+    if not error_body:
+        return ""
+
+    try:
+        parsed = json.loads(error_body)
+    except json.JSONDecodeError:
+        return error_body.strip()
+
+    if isinstance(parsed, dict):
+        nested_error = parsed.get("error")
+        if isinstance(nested_error, dict):
+            message = nested_error.get("message") or nested_error.get("detail")
+            if message:
+                return str(message)
+
+        for key in ("message", "detail"):
+            if key in parsed and parsed[key]:
+                return str(parsed[key])
+
+    return error_body.strip()
+
+
+def _validate_audio_payload(audio_bytes: bytes, content_type: str, request_label: str) -> None:
+    normalized = (content_type or "").lower()
+
+    if (
+        not normalized
+        or normalized.startswith("audio/")
+        or "octet-stream" in normalized
+        or "wav" in normalized
+        or "mpeg" in normalized
+        or "mp3" in normalized
+        or "ogg" in normalized
+        or "opus" in normalized
+    ):
+        return
+
+    preview = audio_bytes[:300].decode("utf-8", errors="replace").strip()
+    raise TTSClientError(
+        "{0} returned non-audio content type '{1}'. Response preview: {2}".format(
+            request_label,
+            content_type or "<missing>",
+            preview or "<empty>",
+        )
+    )
 
 
 def split_text_into_sentence_chunks(text: str, max_chunk_chars: int) -> List[str]:

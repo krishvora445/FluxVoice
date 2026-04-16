@@ -1,5 +1,5 @@
 {
-  "active_profile": "pyttsx3-local",
+  "active_profile": "kokoro-fastapi-local",
   "profiles": {
     "pyttsx3-local": {
       "tts": {
@@ -10,7 +10,7 @@
     "kokoro-fastapi-local": {
       "tts": {
         "backend": "http",
-        "fallback_to_pyttsx3": true,
+        "fallback_to_pyttsx3": false,
         "http": {
           "url": "http://127.0.0.1:8880/v1/audio/speech",
           "model": "kokoro",

@@ -1,0 +1,5 @@
+keyboard
+pyperclip
+pyttsx3
+pygame
+

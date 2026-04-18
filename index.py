@@ -75,6 +75,9 @@ TTS_BACKEND = APP_CONFIG.tts_backend
 HTTP_TTS_CONFIG = APP_CONFIG.http_tts
 HTTP_TTS_FALLBACK_TO_PYTTSX3 = APP_CONFIG.fallback_to_pyttsx3
 WORKSPACE_VENV_PYTHON = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
+HTTP_PREFLIGHT_ATTEMPTS = 12
+HTTP_PREFLIGHT_RETRY_SECONDS = 1.0
+EMPTY_SELECTION_FAST_TIMEOUT_SECONDS = 0.35
 
 
 def format_hotkey_for_display(hotkey):
@@ -241,7 +244,13 @@ class ClipboardSnapshot(object):
                 traceback.print_exc()
 
 
-def wait_for_new_clipboard_text(previous_sequence_number, timeout_seconds=COPY_TIMEOUT_SECONDS, poll_interval_seconds=COPY_POLL_INTERVAL_SECONDS):
+def wait_for_new_clipboard_text(
+    previous_sequence_number,
+    timeout_seconds=COPY_TIMEOUT_SECONDS,
+    poll_interval_seconds=COPY_POLL_INTERVAL_SECONDS,
+    early_no_change_timeout_seconds=None,
+):
+    started_at = time.monotonic()
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         current_sequence_number = _clipboard_sequence_number()
@@ -249,6 +258,13 @@ def wait_for_new_clipboard_text(previous_sequence_number, timeout_seconds=COPY_T
             text = read_clipboard_text_best_effort()
             if text is not None and text.strip():
                 return text
+
+        if (
+            early_no_change_timeout_seconds is not None
+            and current_sequence_number == previous_sequence_number
+            and time.monotonic() - started_at >= early_no_change_timeout_seconds
+        ):
+            return None
         time.sleep(poll_interval_seconds)
 
     return None
@@ -266,11 +282,13 @@ class SpeechBackend(object):
 
 
 class Pyttsx3Backend(SpeechBackend):
-    def __init__(self):
+    def __init__(self, on_playback_start=None, on_playback_stop=None):
         self._speak_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._generation = 0
         self._current_engine = None
+        self._on_playback_start = on_playback_start
+        self._on_playback_stop = on_playback_stop
 
     def _current_generation(self):
         with self._state_lock:
@@ -300,8 +318,13 @@ class Pyttsx3Backend(SpeechBackend):
 
             try:
                 engine.say(text)
+                if self._on_playback_start is not None:
+                    self._on_playback_start(None)
                 engine.runAndWait()
             finally:
+                if self._on_playback_stop is not None:
+                    self._on_playback_stop(None)
+
                 with self._state_lock:
                     if self._current_engine is engine:
                         self._current_engine = None
@@ -418,8 +441,34 @@ def preflight_http_tts_endpoint(http_config):
     return True, "ok"
 
 
+def preflight_http_tts_endpoint_with_retry(http_config, attempts=HTTP_PREFLIGHT_ATTEMPTS, retry_seconds=HTTP_PREFLIGHT_RETRY_SECONDS):
+    last_message = "unknown"
+
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        preflight_ok, preflight_message = preflight_http_tts_endpoint(http_config)
+        if preflight_ok:
+            return True, "ok"
+
+        last_message = preflight_message
+        if attempt < attempts:
+            print(
+                "HTTP preflight attempt {0}/{1} failed ({2}); retrying in {3:.1f}s...".format(
+                    attempt,
+                    attempts,
+                    preflight_message,
+                    retry_seconds,
+                )
+            )
+            time.sleep(retry_seconds)
+
+    return False, last_message
+
+
 def build_tts_backend(on_playback_start=None, on_playback_stop=None):
-    pyttsx3_backend = Pyttsx3Backend()
+    pyttsx3_backend = Pyttsx3Backend(
+        on_playback_start=on_playback_start,
+        on_playback_stop=on_playback_stop,
+    )
 
     if TTS_BACKEND in ("http", "kokoro", "api", "openai"):
         fallback_backend = pyttsx3_backend if HTTP_TTS_FALLBACK_TO_PYTTSX3 else None
@@ -430,14 +479,17 @@ def build_tts_backend(on_playback_start=None, on_playback_stop=None):
                 on_playback_start=on_playback_start,
                 on_playback_stop=on_playback_stop,
             )
-            preflight_ok, preflight_message = preflight_http_tts_endpoint(HTTP_TTS_CONFIG)
+            preflight_ok, preflight_message = preflight_http_tts_endpoint_with_retry(HTTP_TTS_CONFIG)
             if preflight_ok:
                 return http_backend
 
             raise RuntimeError(preflight_message)
         except Exception as exc:
             if fallback_backend is None:
-                raise
+                raise RuntimeError(
+                    "HTTP backend init/preflight failed with fallback disabled: {0}. "
+                    "Kokoro endpoint is required: {1}.".format(exc, HTTP_TTS_CONFIG.url)
+                )
 
             print("HTTP backend init/preflight failed ({0}); falling back to pyttsx3.".format(exc))
             print("Tip: start your local TTS server and verify endpoint {0}.".format(HTTP_TTS_CONFIG.url))
@@ -554,14 +606,17 @@ class TextReaderApp(object):
                 previous_sequence_number,
                 timeout_seconds=self.config.copy_timeout_seconds,
                 poll_interval_seconds=self.config.poll_interval_seconds,
+                early_no_change_timeout_seconds=EMPTY_SELECTION_FAST_TIMEOUT_SECONDS,
             )
 
             if epoch != self._current_request_epoch():
                 return
 
             if not text or not text.strip():
-                self.state_bus.publish(UIState.IDLE)
+                self.state_bus.publish(UIState.ERROR)
                 print("No text was highlighted. (Make sure the text window is active!)")
+                time.sleep(1.2)
+                self.state_bus.publish(UIState.IDLE)
                 return
 
             preview = text.replace("\r", " ").replace("\n", " ")
@@ -586,7 +641,12 @@ def main():
     shutdown_event = threading.Event()
     state_bus = UIStateBus()
     state_bridge = UIStateBridge(state_bus=state_bus)
-    state_bridge.start()
+    try:
+        state_bridge.start()
+    except Exception as exc:
+        print("Fatal: could not start UI state bridge on ws://127.0.0.1:8765 ({0}).".format(exc))
+        print("Tip: make sure only one FluxVoice engine process is running.")
+        return
     print("UI state bridge listening on ws://127.0.0.1:8765")
 
     def on_playback_start(_item):
@@ -595,10 +655,18 @@ def main():
     def on_playback_stop(_item):
         state_bus.publish(UIState.IDLE)
 
-    backend = build_tts_backend(
-        on_playback_start=on_playback_start,
-        on_playback_stop=on_playback_stop,
-    )
+    try:
+        backend = build_tts_backend(
+            on_playback_start=on_playback_start,
+            on_playback_stop=on_playback_stop,
+        )
+    except Exception as exc:
+        print("Fatal: TTS backend startup failed ({0}).".format(exc))
+        state_bus.publish(UIState.ERROR)
+        time.sleep(1.2)
+        state_bus.publish(UIState.IDLE)
+        state_bridge.stop()
+        return
     app = TextReaderApp(backend, state_bus=state_bus)
     overlay = None
     tray = None

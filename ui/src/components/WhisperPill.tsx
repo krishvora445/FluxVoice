@@ -10,12 +10,14 @@ const containerByState: Record<FluxVoiceState, { width: number; height: number; 
   idle: { width: 26, height: 26, opacity: 0.92 },
   processing: { width: 86, height: 30, opacity: 0.98 },
   playing: { width: 122, height: 34, opacity: 1 },
+  error: { width: 42, height: 28, opacity: 0.98 },
 };
 
 const indicatorByState: Record<FluxVoiceState, string> = {
   idle: "dot",
   processing: "pulse",
   playing: "wave",
+  error: "error",
 };
 
 export function WhisperPill({ state, isConnected }: WhisperPillProps) {
@@ -32,7 +34,7 @@ export function WhisperPill({ state, isConnected }: WhisperPillProps) {
     >
       {/* Explicit no-drag island for future interactive controls hitbox boundaries. */}
       <motion.span
-        className="absolute right-[7px] top-[7px] block h-[7px] w-[7px] rounded-full [-webkit-app-region:no-drag]"
+        className="absolute -right-1 -top-1 block h-[8px] w-[8px] rounded-full [-webkit-app-region:no-drag]"
         animate={
           isConnected
             ? {
@@ -97,6 +99,28 @@ export function WhisperPill({ state, isConnected }: WhisperPillProps) {
               }}
             />
           ))}
+        </motion.div>
+      )}
+
+      {mode === "error" && (
+        <motion.div
+          className="relative h-[14px] w-[14px]"
+          animate={{ x: [-1.5, 1.5, -1, 1, 0], opacity: [0.8, 1, 0.9, 1, 0.95] }}
+          transition={{ duration: 0.5, repeat: 2, ease: "easeInOut" }}
+          initial={false}
+        >
+          <motion.span
+            className="absolute left-1/2 top-1/2 block h-[2px] w-[14px] rounded-full bg-white"
+            style={{ transform: "translate(-50%, -50%) rotate(45deg)" }}
+            animate={{ opacity: [0.2, 1, 1] }}
+            transition={{ duration: 0.22, ease: "easeOut" }}
+          />
+          <motion.span
+            className="absolute left-1/2 top-1/2 block h-[2px] w-[14px] rounded-full bg-white"
+            style={{ transform: "translate(-50%, -50%) rotate(-45deg)" }}
+            animate={{ opacity: [0.2, 1, 1] }}
+            transition={{ duration: 0.22, delay: 0.06, ease: "easeOut" }}
+          />
         </motion.div>
       )}
     </motion.div>

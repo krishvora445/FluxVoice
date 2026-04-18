@@ -8,6 +8,7 @@ class UIState(str, Enum):
     IDLE = "idle"
     PROCESSING = "processing"
     PLAYING = "playing"
+    ERROR = "error"
 
 
 class UIStateBus(object):

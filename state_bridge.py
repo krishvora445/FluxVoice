@@ -21,6 +21,8 @@ class UIStateBridge(object):
         self._clients: Set[websockets.WebSocketServerProtocol] = set()
         self._shutdown_event = threading.Event()
         self._started_event = threading.Event()
+        self._serving_event = threading.Event()
+        self._startup_error: Optional[Exception] = None
         self._unsubscribe = None
 
     def start(self) -> None:
@@ -30,6 +32,13 @@ class UIStateBridge(object):
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="ui-state-bridge")
         self._thread.start()
         self._started_event.wait(timeout=2.0)
+
+        # Wait for successful bind or early thread failure.
+        self._serving_event.wait(timeout=2.0)
+        if self._startup_error is not None:
+            raise RuntimeError("UI state bridge startup failed: {0}".format(self._startup_error))
+        if not self._serving_event.is_set():
+            raise RuntimeError("UI state bridge startup timed out before server bind.")
 
         self._unsubscribe = self._state_bus.subscribe(self._on_state_change, emit_current=False)
 
@@ -73,6 +82,8 @@ class UIStateBridge(object):
 
         try:
             self._loop.run_until_complete(self._serve())
+        except Exception as exc:
+            self._startup_error = exc
         finally:
             try:
                 pending = asyncio.all_tasks(self._loop)
@@ -85,6 +96,7 @@ class UIStateBridge(object):
 
     async def _serve(self) -> None:
         async with websockets.serve(self._handle_client, self._host, self._port):
+            self._serving_event.set()
             await self._broadcast_loop()
 
     async def _handle_client(self, websocket: websockets.WebSocketServerProtocol) -> None:

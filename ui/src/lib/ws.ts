@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-export type FluxVoiceState = "idle" | "processing" | "playing";
+export type FluxVoiceState = "idle" | "processing" | "playing" | "error";
 
 type FluxVoicePayload = {
   state?: string;
@@ -17,7 +17,7 @@ const BASE_RETRY_MS = 400;
 const MAX_RETRY_MS = 8000;
 
 function isFluxVoiceState(value: unknown): value is FluxVoiceState {
-  return value === "idle" || value === "processing" || value === "playing";
+  return value === "idle" || value === "processing" || value === "playing" || value === "error";
 }
 
 export function useFluxVoiceState() {

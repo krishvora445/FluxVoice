@@ -48,8 +48,11 @@ Write-Host "Set APP_PROFILE=$profileName in .env"
 Write-Host "Configured endpoint: $endpoint"
 
 $uri = [System.Uri]$endpoint
-Write-Host "Run Kokoro container:"
-Write-Host "docker run --rm -p $($uri.Port):5000 ghcr.io/remsky/kokoro-fastapi:latest"
+Write-Host "Run Kokoro container (preferred):"
+Write-Host "docker compose up -d"
+Write-Host ""
+Write-Host "If you want to run it manually instead:"
+Write-Host "docker run --rm -p $($uri.Port):$($uri.Port) ghcr.io/remsky/kokoro-fastapi-cpu:latest"
 
 if ($CheckEndpoint) {
     $check = Test-NetConnection -ComputerName $uri.Host -Port $uri.Port -WarningAction SilentlyContinue
@@ -82,4 +85,3 @@ if ($SmokeTest) {
         }
     }
 }
-

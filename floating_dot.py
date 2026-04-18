@@ -1,3 +1,4 @@
+import queue
 import threading
 import tkinter as tk
 
@@ -8,6 +9,8 @@ class FloatingDotWindow(object):
     def __init__(self, state_bus: UIStateBus, shutdown_event: threading.Event):
         self._state_bus = state_bus
         self._shutdown_event = shutdown_event
+        self._state_events: "queue.Queue[UIState]" = queue.Queue()
+        self._unsubscribe_state = self._state_bus.subscribe(self._on_state_change, emit_current=True)
         self._window_size = 48
         self._bottom_padding = 36
         self._transparent_key = "#010203"
@@ -34,6 +37,9 @@ class FloatingDotWindow(object):
         self._dot_id = None
         self._current_state = None
         self._place_bottom_center()
+
+    def _on_state_change(self, state: UIState):
+        self._state_events.put(state)
 
     def _place_bottom_center(self):
         screen_width = self._root.winfo_screenwidth()
@@ -71,7 +77,13 @@ class FloatingDotWindow(object):
             self._canvas.itemconfig(self._dot_id, fill=color)
 
     def _tick(self):
-        latest_state = self._state_bus.drain_latest()
+        latest_state = None
+        while True:
+            try:
+                latest_state = self._state_events.get_nowait()
+            except queue.Empty:
+                break
+
         if latest_state is not None:
             self._render_state(latest_state)
 
@@ -95,6 +107,11 @@ class FloatingDotWindow(object):
         except KeyboardInterrupt:
             self._shutdown_event.set()
         finally:
+            if self._unsubscribe_state is not None:
+                try:
+                    self._unsubscribe_state()
+                except Exception:
+                    pass
             try:
                 self._root.destroy()
             except tk.TclError:

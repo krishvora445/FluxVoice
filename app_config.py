@@ -69,6 +69,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "api_key": "",
         },
     },
+    "ui": {
+        "enable_legacy_ui": False,
+    },
 }
 
 
@@ -225,6 +228,7 @@ class AppConfig(object):
     tts_backend: str
     fallback_to_pyttsx3: bool
     http_tts: HttpTTSConfig
+    enable_legacy_ui: bool
     config_json_path: str
     env_file_path: str
     loaded_config_json: bool
@@ -303,6 +307,7 @@ def load_app_config(base_dir: str) -> AppConfig:
     queue_config = merged.get("queue", {})
     tts_config = merged.get("tts", {})
     http_config = tts_config.get("http", {})
+    ui_config = merged.get("ui", {})
 
     streaming_mode = _to_string(http_config.get("streaming_mode"), "auto").lower()
     if streaming_mode not in {"auto", "on", "off"}:
@@ -334,6 +339,7 @@ def load_app_config(base_dir: str) -> AppConfig:
             response_format=_to_string(http_config.get("response_format"), "wav").lower(),
             api_key=_to_string(http_config.get("api_key"), ""),
         ),
+        enable_legacy_ui=_to_bool(ui_config.get("enable_legacy_ui"), False),
         config_json_path=str(config_path),
         env_file_path=str(env_path),
         loaded_config_json=loaded_config_json,

@@ -16,6 +16,7 @@ import pyttsx3
 from app_config import AppConfig, load_app_config
 from audio_player import AudioPlayer
 from floating_dot import FloatingDotWindow
+from state_bridge import UIStateBridge
 from tray_icon import SystemTrayIcon
 from tts_client import (
     OpenAITTSClient,
@@ -584,6 +585,9 @@ class TextReaderApp(object):
 def main():
     shutdown_event = threading.Event()
     state_bus = UIStateBus()
+    state_bridge = UIStateBridge(state_bus=state_bus)
+    state_bridge.start()
+    print("UI state bridge listening on ws://127.0.0.1:8765")
 
     def on_playback_start(_item):
         state_bus.publish(UIState.PLAYING)
@@ -596,13 +600,18 @@ def main():
         on_playback_stop=on_playback_stop,
     )
     app = TextReaderApp(backend, state_bus=state_bus)
-    overlay = FloatingDotWindow(state_bus=state_bus, shutdown_event=shutdown_event)
+    overlay = None
+    tray = None
 
-    tray = SystemTrayIcon(
-        on_quit=lambda: shutdown_event.set(),
-        on_settings=lambda: print("Settings clicked (coming soon)."),
-    )
-    tray.start()
+    if APP_CONFIG.enable_legacy_ui:
+        overlay = FloatingDotWindow(state_bus=state_bus, shutdown_event=shutdown_event)
+        tray = SystemTrayIcon(
+            on_quit=lambda: shutdown_event.set(),
+            on_settings=lambda: print("Settings clicked (coming soon)."),
+        )
+        tray.start()
+    else:
+        print("Legacy Tkinter/pystray UI disabled (ui.enable_legacy_ui=false).")
 
     def request_shutdown():
         print("Shutdown requested. Exiting...")
@@ -637,14 +646,20 @@ def main():
     quit_hotkey_id = keyboard.add_hotkey(app.config.quit_hotkey, request_shutdown, suppress=True, trigger_on_release=True)
 
     try:
-        overlay.run()
+        if overlay is not None:
+            overlay.run()
+        else:
+            while not shutdown_event.is_set():
+                time.sleep(0.2)
     except KeyboardInterrupt:
         request_shutdown()
     finally:
         keyboard.remove_hotkey(read_hotkey_id)
         keyboard.remove_hotkey(stop_hotkey_id)
         keyboard.remove_hotkey(quit_hotkey_id)
-        tray.stop()
+        if tray is not None:
+            tray.stop()
+        state_bridge.stop()
         app.stop()
 
 

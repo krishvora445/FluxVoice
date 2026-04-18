@@ -46,6 +46,9 @@
   "queue": {
     "maxsize": 4
   },
+  "ui": {
+    "enable_legacy_ui": false
+  },
   "tts": {
     "backend": "pyttsx3",
     "fallback_to_pyttsx3": true,

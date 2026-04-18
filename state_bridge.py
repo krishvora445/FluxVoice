@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import threading
 import time
 from typing import Optional, Set
@@ -24,6 +25,12 @@ class UIStateBridge(object):
         self._serving_event = threading.Event()
         self._startup_error: Optional[Exception] = None
         self._unsubscribe = None
+        # Suppress expected invalid-handshake noise from port probes and half-open sockets.
+        self._ws_logger = logging.getLogger("fluxvoice.state_bridge.ws")
+        self._ws_logger.propagate = False
+        self._ws_logger.setLevel(logging.CRITICAL)
+        if not self._ws_logger.handlers:
+            self._ws_logger.addHandler(logging.NullHandler())
 
     def start(self) -> None:
         if self._thread is not None:
@@ -95,7 +102,12 @@ class UIStateBridge(object):
                 self._loop.close()
 
     async def _serve(self) -> None:
-        async with websockets.serve(self._handle_client, self._host, self._port):
+        async with websockets.serve(
+            self._handle_client,
+            self._host,
+            self._port,
+            logger=self._ws_logger,
+        ):
             self._serving_event.set()
             await self._broadcast_loop()
 

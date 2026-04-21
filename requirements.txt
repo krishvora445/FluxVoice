@@ -1,7 +1,7 @@
 keyboard
 pyperclip
 pyttsx3
-pygame
+sounddevice
 pystray
 Pillow
 websockets

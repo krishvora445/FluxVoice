@@ -21,9 +21,7 @@ from tray_icon import SystemTrayIcon
 from tts_client import (
     OpenAITTSClient,
     TTSClientError,
-    cleanup_temp_file,
     split_text_into_sentence_chunks,
-    write_temp_audio_file,
 )
 from ui_state import UIState, UIStateBus
 
@@ -394,8 +392,10 @@ class HttpTTSBackend(SpeechBackend):
             if self._is_stale(request_generation):
                 return
 
-            result = self.client.synthesize(chunk)
+            result = self.client.synthesize_stream(chunk)
             if self._is_stale(request_generation):
+                if hasattr(result, "close") and callable(result.close):
+                    result.close()
                 return
 
             if not first_audio_logged:
@@ -406,21 +406,10 @@ class HttpTTSBackend(SpeechBackend):
                 print("HTTP TTS first-audio latency: {0} ms ({1}).".format(latency_ms, mode_label))
                 first_audio_logged = True
 
-            default_extension = "." + str(self.http_config.response_format).lstrip(".")
-            temp_audio_path = write_temp_audio_file(
-                audio_bytes=result.audio_bytes,
-                content_type=result.content_type,
-                default_extension=default_extension,
-            )
-
-            if self._is_stale(request_generation):
-                cleanup_temp_file(temp_audio_path)
-                return
-
-            self.audio_player.enqueue_file(
-                file_path=temp_audio_path,
+            self.audio_player.enqueue_stream(
+                audio_chunks=result.audio_chunks,
                 generation=request_generation,
-                cleanup_callback=cleanup_temp_file,
+                close_callback=result.close,
             )
 
         if len(chunks) > 1:

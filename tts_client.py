@@ -4,10 +4,11 @@ import os
 import re
 import socket
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, Iterator, List, Optional
 
 from app_config import HttpTTSConfig
 
@@ -21,6 +22,14 @@ class SynthesizedAudio(object):
     audio_bytes: bytes
     content_type: str
     used_streaming: bool
+
+
+@dataclass
+class SynthesizedAudioStream(object):
+    content_type: str
+    used_streaming: bool
+    audio_chunks: Iterable[bytes]
+    close: Optional[Callable[[], None]] = None
 
 
 def write_temp_audio_file(audio_bytes: bytes, content_type: str, default_extension: str = ".wav") -> str:
@@ -66,6 +75,26 @@ class OpenAITTSClient(object):
         self.config = config
 
     def synthesize(self, text: str) -> SynthesizedAudio:
+        stream_result = self.synthesize_stream(text)
+        try:
+            audio_bytes = b"".join(stream_result.audio_chunks)
+        finally:
+            if stream_result.close is not None:
+                try:
+                    stream_result.close()
+                except Exception:
+                    pass
+
+        if not audio_bytes:
+            raise TTSClientError("TTS request returned an empty audio payload.")
+
+        return SynthesizedAudio(
+            audio_bytes=audio_bytes,
+            content_type=stream_result.content_type,
+            used_streaming=stream_result.used_streaming,
+        )
+
+    def synthesize_stream(self, text: str) -> SynthesizedAudioStream:
         if self.config.streaming_mode in {"on", "auto"}:
             try:
                 return self._synthesize_with_stream_flag(text)
@@ -75,49 +104,59 @@ class OpenAITTSClient(object):
 
         return self._synthesize_buffered(text)
 
-    def _synthesize_with_stream_flag(self, text: str) -> SynthesizedAudio:
+    def _synthesize_with_stream_flag(self, text: str) -> SynthesizedAudioStream:
         payload = self._build_payload(text, stream=True)
 
-        with self._post_json(payload) as response:
-            content_type = response.headers.get("Content-Type", "")
-            content_type_lower = content_type.lower()
+        response = self._post_json(payload)
+        content_type = response.headers.get("Content-Type", "")
+        content_type_lower = content_type.lower()
+        stream_lock = threading.Lock()
 
-            if "text/event-stream" in content_type_lower:
-                audio_bytes = b"".join(self._iter_sse_audio_chunks(response))
-                if not audio_bytes:
-                    raise TTSClientError("Streaming endpoint returned no audio chunks.")
-                return SynthesizedAudio(
-                    audio_bytes=audio_bytes,
-                    content_type=content_type,
-                    used_streaming=True,
-                )
+        def close_response() -> None:
+            with stream_lock:
+                try:
+                    response.close()
+                except Exception:
+                    pass
 
-            audio_bytes = response.read()
-            if not audio_bytes:
-                raise TTSClientError("Streaming request returned an empty body.")
-            _validate_audio_payload(audio_bytes, content_type, "Streaming request")
-
-            return SynthesizedAudio(
-                audio_bytes=audio_bytes,
+        if "text/event-stream" in content_type_lower:
+            iterator = self._iter_sse_audio_chunks(response, stream_lock)
+            return SynthesizedAudioStream(
                 content_type=content_type,
-                used_streaming=False,
+                used_streaming=True,
+                audio_chunks=iterator,
+                close=close_response,
             )
 
-    def _synthesize_buffered(self, text: str) -> SynthesizedAudio:
-        payload = self._build_payload(text, stream=False)
-
-        with self._post_json(payload) as response:
-            audio_bytes = response.read()
-            content_type = response.headers.get("Content-Type", "")
-
-        if not audio_bytes:
-            raise TTSClientError("Buffered request returned an empty body.")
-        _validate_audio_payload(audio_bytes, content_type, "Buffered request")
-
-        return SynthesizedAudio(
-            audio_bytes=audio_bytes,
+        _validate_streaming_content_type(content_type, "Streaming request")
+        iterator = self._iter_raw_audio_chunks(response, stream_lock)
+        return SynthesizedAudioStream(
             content_type=content_type,
             used_streaming=False,
+            audio_chunks=iterator,
+            close=close_response,
+        )
+
+    def _synthesize_buffered(self, text: str) -> SynthesizedAudioStream:
+        payload = self._build_payload(text, stream=False)
+        response = self._post_json(payload)
+        content_type = response.headers.get("Content-Type", "")
+        _validate_streaming_content_type(content_type, "Buffered request")
+        stream_lock = threading.Lock()
+
+        def close_response() -> None:
+            with stream_lock:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+        iterator = self._iter_raw_audio_chunks(response, stream_lock)
+        return SynthesizedAudioStream(
+            content_type=content_type,
+            used_streaming=False,
+            audio_chunks=iterator,
+            close=close_response,
         )
 
     def _build_payload(self, text: str, stream: bool) -> Dict[str, object]:
@@ -171,26 +210,63 @@ class OpenAITTSClient(object):
         except (TimeoutError, socket.timeout) as exc:
             raise TTSClientError("TTS request timed out.") from exc
 
-    def _iter_sse_audio_chunks(self, response) -> Iterable[bytes]:
-        for raw_line in response:
-            decoded_line = raw_line.decode("utf-8", errors="replace").strip()
-            if not decoded_line or decoded_line.startswith(":"):
-                continue
-            if not decoded_line.startswith("data:"):
-                continue
+    def _iter_sse_audio_chunks(self, response, stream_lock: threading.Lock) -> Iterator[bytes]:
+        saw_audio = False
+        try:
+            for raw_line in response:
+                decoded_line = raw_line.decode("utf-8", errors="replace").strip()
+                if not decoded_line or decoded_line.startswith(":"):
+                    continue
+                if not decoded_line.startswith("data:"):
+                    continue
 
-            data_payload = decoded_line[5:].strip()
-            if not data_payload or data_payload in {"[DONE]", "DONE"}:
-                continue
+                data_payload = decoded_line[5:].strip()
+                if not data_payload or data_payload in {"[DONE]", "DONE"}:
+                    continue
 
-            try:
-                message = json.loads(data_payload)
-            except json.JSONDecodeError:
-                continue
+                try:
+                    message = json.loads(data_payload)
+                except json.JSONDecodeError:
+                    continue
 
-            maybe_audio = _extract_base64_audio(message)
-            if maybe_audio:
-                yield maybe_audio
+                maybe_audio = _extract_base64_audio(message)
+                if maybe_audio:
+                    saw_audio = True
+                    yield maybe_audio
+        finally:
+            with stream_lock:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+        if not saw_audio:
+            raise TTSClientError("Streaming endpoint returned no audio chunks.")
+
+    def _iter_raw_audio_chunks(self, response, stream_lock: threading.Lock, read_size: int = 4096) -> Iterator[bytes]:
+        saw_data = False
+        first_chunk = b""
+        try:
+            while True:
+                chunk = response.read(read_size)
+                if not chunk:
+                    break
+
+                if not saw_data:
+                    first_chunk = chunk
+                    _validate_audio_payload(first_chunk, response.headers.get("Content-Type", ""), "HTTP request")
+                    saw_data = True
+
+                yield chunk
+        finally:
+            with stream_lock:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+        if not saw_data:
+            raise TTSClientError("HTTP request returned an empty body.")
 
 
 def _extract_base64_audio(message: Dict[str, object]) -> Optional[bytes]:
@@ -266,6 +342,29 @@ def _validate_audio_payload(audio_bytes: bytes, content_type: str, request_label
             request_label,
             content_type or "<missing>",
             preview or "<empty>",
+        )
+    )
+
+
+def _validate_streaming_content_type(content_type: str, request_label: str) -> None:
+    normalized = (content_type or "").lower()
+    if (
+        not normalized
+        or normalized.startswith("audio/")
+        or "octet-stream" in normalized
+        or "wav" in normalized
+        or "mpeg" in normalized
+        or "mp3" in normalized
+        or "ogg" in normalized
+        or "opus" in normalized
+        or "text/event-stream" in normalized
+    ):
+        return
+
+    raise TTSClientError(
+        "{0} returned non-audio content type '{1}'.".format(
+            request_label,
+            content_type or "<missing>",
         )
     )
 

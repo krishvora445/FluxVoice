@@ -57,7 +57,7 @@
       "timeout_seconds": 30.0,
       "streaming_mode": "auto",
       "chunking_enabled": true,
-      "max_chunk_chars": 350,
+      "max_chunk_chars": 40,
       "model": "kokoro",
       "voice": "af_heart",
       "response_format": "wav",
